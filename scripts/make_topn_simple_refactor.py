@@ -141,6 +141,10 @@ def write_excel(
             ws = wb.copy_worksheet(ws_tpl)
             copy_conditional_formatting(ws, ws_tpl)
             ws.title = f"{store}({page+1})"
+
+            # ★ 追加: 8日以上のときタイトル末尾に (1),(2)… を付与
+            page_suffix = f" ({page+1})" if num_pages > 1 else ""
+
             # 該当ページの4日分
             page_dates = dates[page*4 : (page+1)*4]
 
@@ -154,7 +158,8 @@ def write_excel(
                     continue
 
                 # === タイトル A1 ===
-                title_text = f"{event_name}　{d}　{cat_name}単品データ"
+                # ★ 置換: 日付は YYYY-MM-DD 表記＋ページ番号サフィックスを追加
+                title_text = f"{event_name}　{pd.to_datetime(d).strftime('%Y-%m-%d')}　{cat_name}単品データ{page_suffix}"
                 ws["A1"].value = title_text
 
                 # === ブロックヘッダ ===
@@ -238,32 +243,77 @@ def write_excel(
     wb.save(out_path)
     print(f"[ok] saved → {out_path}")
 
+# === TopN 作成（store×date×大分類で金額降順TopN） ===
+def aggregate_topn(df_sales: pd.DataFrame, category: int, top_n: int = 35, dates=None):
+    """
+    df_sales : 列に date, store_id, category_large, jan, name, amount, (qty, discount 任意)
+    dates    : list[date] or None
+    戻り値   : dict[store_id -> dict[date -> DataFrame(TopN降順)]]
+    """
+    gdf = df_sales.copy()
+
+    # 型正規化
+    gdf["date"] = pd.to_datetime(gdf["date"], errors="coerce").dt.date
+    gdf["store_id"] = gdf["store_id"].astype(str)
+    gdf["category_large"] = gdf["category_large"].astype(str)
+
+    # 日付フィルタ（指定時のみ）
+    if dates:
+        dt_set = set(pd.to_datetime(dates).date)
+        gdf = gdf[gdf["date"].isin(dt_set)]
+
+    # 大分類フィルタ
+    gdf = gdf[gdf["category_large"] == str(category)]
+
+    # 同一 (date, store, jan) を合算して 4倍問題を恒久対策
+    agg_map = {"amount": "sum"}
+    if "qty" in gdf.columns: agg_map["qty"] = "sum"
+    if "discount" in gdf.columns: agg_map["discount"] = "sum"
+    if "name" in gdf.columns: agg_map["name"] = "first"
+
+    gdf = (
+        gdf.groupby(["date", "store_id", "jan"], as_index=False, sort=False)
+           .agg(agg_map)
+    )
+
+    # 金額降順でTopN抽出 → store×date の辞書に
+    out = {}
+    for (store, d), sub in gdf.groupby(["store_id", "date"], sort=False):
+        sub = sub.sort_values("amount", ascending=False).head(top_n).reset_index(drop=True)
+        out.setdefault(store, {})[d] = sub
+
+    return out
+
 if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+    import pandas as pd
+
+    parser = argparse.ArgumentParser(description="TopN distributor Excel generator (refactored)")
+    parser.add_argument("--event-name", type=str, default="秋の感謝セール")
+    parser.add_argument("--category", type=int, required=True)
+    parser.add_argument("--dates", type=str, required=True, help="YYYY-MM-DD をカンマ区切り")
+    parser.add_argument("--out", type=str, required=True)
+    args = parser.parse_args()
+
     print("[debug] 開始")
+    proj_root = Path(__file__).resolve().parents[1]
+    sales_root = proj_root / "data" / "material"
+    template_path = proj_root / "data" / "template" / "配布フォーマット.xlsx"
+    store_master = sales_root / "master" / "store_master.xlsx"
 
-    root = Path("data/material")
-    df = load_sales(root)
-    print(f"[debug] sales rows={len(df)}")
-
-    store_names = load_store_master(root / "master" / "store_master.xlsx")
-    print(f"[debug] stores={len(store_names)}")
-
-    category = "4"  # 冷総菜
-    dates = ["2025-01-03", "2025-01-10", "2025-01-17", "2025-01-24"]
-
-    df_f = filter_sales(df, category, dates)
-    print(f"[debug] filtered rows={len(df_f)}")
-
-    topn = build_topn(df_f, top_n=35)
-    print(f"[debug] topn stores={len(topn)}")
+    df_sales = load_sales(sales_root)
+    stores = load_store_master(store_master)
+    dates = [pd.to_datetime(x).date() for x in args.dates.split(",")]
+    topn = aggregate_topn(df_sales, category=args.category, top_n=35, dates=dates)
 
     write_excel(
-        template_path="data/template/配布フォーマット.xlsx",
-        out_path="data/output/topN_冷総菜_202501.xlsx",
+        template_path=template_path,
+        out_path=Path(args.out),          # ← ここだけを使う！
         topn_dict=topn,
-        store_names=store_names,
-        category=category,
+        store_names=stores,
+        category=args.category,
         dates=dates,
-        event_name="秋の感謝セール",
-        df_sales_all=df
+        event_name=args.event_name,
+        df_sales_all=df_sales,
     )
