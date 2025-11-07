@@ -5,13 +5,19 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 import math
 from openpyxl.formatting.rule import Rule
+from calendar import monthrange
+# ファイル冒頭の import 群に追加
+import re
 
 CATEGORY_MAP = {
     "1": "寿司", "2": "米飯", "3": "温惣菜",
     "4": "冷総菜", "5": "軽食", "6": "魚惣菜",
 }
 
-# 先頭でimport
+def _month_keys_from_dates(dates):
+    """dates(list[str or date]) → {'2024-12', '2025-01'} のような集合"""
+    dt = pd.to_datetime(dates).date
+    return {f"{d.year:04d}-{d.month:02d}" for d in dt}
 
 def copy_conditional_formatting(ws_dst, ws_src):
     """
@@ -46,24 +52,51 @@ def copy_conditional_formatting(ws_dst, ws_src):
             ws_dst.conditional_formatting.add(rng, new_rule)
 
 # === CSV読込 ===
-def load_sales(csv_root: Path) -> pd.DataFrame:
-    files = list(csv_root.glob("2025/*.csv"))
-    if not files:
-        raise FileNotFoundError(f"no csv files under {csv_root/'2025'}")
+def load_sales(root: Path, dates=None) -> pd.DataFrame:
+    """
+    data/material/YYYY/IT_YYYYMM.csv を必要分だけ読む（年月またぎ対応）。
+    返り値は標準列:
+      date (datetime.date), store_id (str), category_large (str),
+      jan (str), name (str), amount (float), qty (float), discount (float)
+    同一 (date, store, category_large, jan) は合算（nameはfirst）
+    """
+    root = Path(root)
+    # 読むべき年月を決定
+    if dates:
+        dates = [pd.to_datetime(d).date() for d in dates]
+        ym_keys = sorted({(d.year, d.month) for d in dates})
+    else:
+        # dates未指定ならルート配下を総当り（従来動作）
+        ym_keys = []
+        for y_dir in (root.glob("*")):
+            if y_dir.is_dir() and y_dir.name.isdigit():
+                for f in y_dir.glob("IT_*.csv"):
+                    # IT_YYYYMM.csv から (YYYY,MM) を推定
+                    stem = f.stem  # IT_202501
+                    y = int(stem.split("_")[1][:4])
+                    m = int(stem.split("_")[1][4:6])
+                    ym_keys.append((y, m))
+        ym_keys = sorted(set(ym_keys))
 
-    def read_csv_any(path: Path) -> pd.DataFrame:
+    files = []
+    for y, m in ym_keys:
+        f = root / f"{y}" / f"IT_{y}{m:02d}.csv"
+        if f.exists():
+            files.append(f)
+
+    if not files:
+        raise FileNotFoundError(f"no monthly files for {ym_keys} under {root}")
+
+    # 読み込み＋列標準化
+    def _read_any(p: Path) -> pd.DataFrame:
         for enc in ("cp932", "utf-8-sig", "utf-8"):
             try:
-                return pd.read_csv(path, encoding=enc)
+                return pd.read_csv(p, encoding=enc)
             except Exception:
                 continue
-            df_day = df_day.sort_values("amount", ascending=False)  # ←ここ！
-        raise UnicodeDecodeError("utf-8", b"", 0, 1, f"Failed to decode {path}")
+        return pd.read_csv(p)  # 最後の保険
 
-    df = pd.concat((read_csv_any(f) for f in files), ignore_index=True)
-
-    # === 列名を英名に正規化 ===
-    df = df.rename(columns={
+    rename_map = {
         "売上日": "date",
         "店舗コード": "store_id",
         "大分類コード": "category_large",
@@ -74,28 +107,56 @@ def load_sales(csv_root: Path) -> pd.DataFrame:
         "総売上金額": "amount",
         "総売上数量": "qty",
         "値引金額": "discount",
-    })
+    }
 
-    # === 型変換・整形 ===
+    df = pd.concat((_read_any(f) for f in files), ignore_index=True)
+    df = df.rename(columns=rename_map)
+
+    # 型正規化
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     df["store_id"] = df["store_id"].astype(str)
-    df["jan"] = df["jan"].astype(str).str.strip()
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
-    df["discount"] = pd.to_numeric(df.get("discount", 0), errors="coerce").fillna(0)
+    df["category_large"] = df["category_large"].astype(str)
+    df["jan"] = df["jan"].astype(str)
+    for col in ("amount", "qty", "discount"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
+        else:
+            df[col] = 0.0
+
+    if dates:
+        use = set(dates)
+        df = df[df["date"].isin(use)]
+
+    # 4倍問題の再発防止：category_large を含めて集約（←ここが重要）
+    agg_map = {"amount": "sum", "qty": "sum", "discount": "sum", "name": "first"}
+    df = (df.groupby(["date", "store_id", "category_large", "jan"], as_index=False)
+            .agg(agg_map))
+
     return df
 
 # === 店舗マスター ===
-def load_store_master(path: Path) -> dict:
+# === store_master 読み込み（store/name/short_name 想定） ===
+def load_store_master(path: Path) -> dict[str, str]:
+    import pandas as pd
     sm = pd.read_excel(path)
+
+    # 列名を内部統一
     sm = sm.rename(columns={
         "store": "store_id",
         "name": "store_name",
         "short_name": "short_name",
     })
-    sm["store_id"] = sm["store_id"].astype(str)
-    return sm.set_index("store_id")["short_name"].to_dict()
 
+    # 型そろえ（店番は文字列化）
+    sm["store_id"] = sm["store_id"].astype(str)
+
+    # short_name が欠けてたら store_name で補完
+    if "short_name" not in sm.columns:
+        sm["short_name"] = sm["store_name"]
+    sm["short_name"] = sm["short_name"].fillna(sm["store_name"])
+
+    # 辞書 { "1": "神栖店", ... } を返す
+    return dict(zip(sm["store_id"], sm["short_name"]))
 
 # === 大分類・日付でフィルタ ===
 def filter_sales(df: pd.DataFrame, category: str, dates: list[str]) -> pd.DataFrame:
@@ -114,6 +175,110 @@ def build_topn(df: pd.DataFrame, top_n=30) -> dict:
         result.setdefault(store, {})[date] = g
     return result
 
+from openpyxl import Workbook
+
+def _add_pages_for_one_store(wb, ws_tpl, store, store_short_name, dates, day_map, cat_name, event_name,
+                             total_all_dict, total_cat_dict, category):
+    block_offsets = [0, 8, 16, 24]
+    total_days = len(dates)
+    num_pages = math.ceil(total_days / 4)
+
+    for page in range(num_pages):
+        ws = wb.copy_worksheet(ws_tpl)
+        copy_conditional_formatting(ws, ws_tpl)
+        ws.title = f"{store}({page+1})"
+
+        page_dates = dates[page*4 : (page+1)*4]
+        for block_idx, d in enumerate(page_dates):
+            if block_idx >= 4: break
+            col_offset = block_offsets[block_idx]
+            d_date = pd.to_datetime(d).date()
+            df_day = day_map.get(d_date)
+            if df_day is None or df_day.empty:
+                continue
+
+            # タイトル
+            ws["A1"].value = f"{event_name}　{pd.to_datetime(d).strftime('%Y-%m-%d')}　{cat_name}単品データ" + (f" ({page+1})" if num_pages>1 else "")
+
+            # ブロックヘッダ
+            year2 = str(pd.to_datetime(d).year)[2:]
+            mmdd  = pd.to_datetime(d).strftime("%m/%d")
+            ws.cell(row=2, column=1+col_offset, value=year2)
+            ws.cell(row=2, column=2+col_offset, value=mmdd)
+            ws.cell(row=2, column=3+col_offset, value=store_short_name)
+            ws.cell(row=2, column=4+col_offset, value=f"{cat_name}単品")
+
+            # 見出し
+            headers = ["順位", "商品名", "売上金額", "売上数量", "値引金額", "値引率"]
+            for i, h in enumerate(headers):
+                ws.cell(row=3, column=1+col_offset+i, value=h)
+
+            # 明細（df_day は降順TopN想定）
+            for rank, row in enumerate(df_day.itertuples(index=False), start=1):
+                if rank > 35: break
+                r = 3 + rank
+                amt  = float(getattr(row, "amount", 0) or 0.0)
+                qty  = float(getattr(row, "qty", 0) or 0.0)
+                disc = float(getattr(row, "discount", 0) or 0.0)
+                rate = (disc/amt) if amt else 0.0
+
+                ws.cell(r, 1+col_offset, rank)
+                ws.cell(r, 2+col_offset, getattr(row, "name", ""))
+                ws.cell(r, 3+col_offset, amt)
+                ws.cell(r, 4+col_offset, qty)
+                ws.cell(r, 5+col_offset, disc)
+                c = ws.cell(r, 6+col_offset, rate)
+                c.number_format = "0.00%"
+
+            # フッタ
+            row_base = 39
+            ws.cell(row=row_base+1, column=1+col_offset, value="惣菜売上金額")
+            ws.cell(row=row_base+2, column=1+col_offset, value=f"{cat_name}売上金額")
+            ws.cell(row=row_base+3, column=1+col_offset, value=f"{cat_name}構成比")
+
+            total_store_amount = total_all_dict.get((d_date, store), 0.0)
+            total_cat_amount   = total_cat_dict.get((d_date, store), 0.0)
+            ratio = (total_cat_amount/total_store_amount) if total_store_amount else 0.0
+
+            ws.cell(row=row_base+1, column=3+col_offset, value=total_store_amount)
+            ws.cell(row=row_base+2, column=3+col_offset, value=total_cat_amount)
+            ws.cell(row=row_base+3, column=3+col_offset, value=ratio)
+            ws.cell(row=row_base+3, column=3+col_offset).number_format = "0.00%"
+
+def save_per_store_files(master_path: Path, out_root: Path, category_name: str):
+    """
+    生成済みのマスターExcel(master_path)を基に、
+    店番ごとのシートだけ残して新規ファイルとして保存する。
+    フォーマット・条件付き書式・書式は維持される。
+    """
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # 一度開いてシート→店番の対応を取得
+    wb_probe = load_workbook(master_path)
+    store_to_sheets: dict[str, list[str]] = {}
+    for s in wb_probe.sheetnames:
+        m = re.match(r"^(\d+)\((\d+)\)$", s)  # 例: "25(1)"
+        if m:
+            sid = m.group(1)
+            store_to_sheets.setdefault(sid, []).append(s)
+    wb_probe.close()
+
+    # 店番ごとにファイル生成：毎回マスターを開きなおして不要シートを削除
+    for sid, sheets in store_to_sheets.items():
+        wb = load_workbook(master_path)
+        for name in list(wb.sheetnames):
+            if name not in sheets:
+                ws = wb[name]
+                wb.remove(ws)
+
+        # 保存先: split/<店番>/<店番>_<大分類名>単品データ.xlsx
+        out_dir = out_root / sid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{sid}_{category_name}単品データ.xlsx"
+        wb.save(out_path)
+        wb.close()
+
 # === Excel書き出し ===
 def write_excel(
     template_path,
@@ -123,125 +288,111 @@ def write_excel(
     category,
     dates,
     event_name="イベント名",
-    df_sales_all=None,  # ←追加
+    df_sales_all=None,
+    split_by_store=False,
+    split_dir="",        # ← これだけ持つ（out_store_dir は廃止）
 ):
 
-    wb = load_workbook(template_path)
-    ws_tpl = wb["TEMPLATE"]
-
+    wb0 = load_workbook(template_path)
+    ws_tpl0 = wb0["TEMPLATE"]
     cat_name = CATEGORY_MAP.get(str(category), str(category))
-    total_days = len(dates)
-    num_pages = math.ceil(total_days / 4)
-    block_offsets = [0, 8, 16, 24]  # 各ブロックの列オフセット
 
-    for store in sorted(topn_dict.keys(), key=lambda x: int(x)):
-        day_map = topn_dict[store]
-        short_name = store_names.get(store, "")
-        for page in range(num_pages):
-            ws = wb.copy_worksheet(ws_tpl)
-            copy_conditional_formatting(ws, ws_tpl)
-            ws.title = f"{store}({page+1})"
+    # === 合計のための辞書（全惣菜 / 大分類）を先に作る ===
+    # df_sales_all は load_sales 後のもの（同一キー集約済み）なので、
+    # 「大分類合計」は dates と store で再集計が必要。
+    # → 全体合計はそのまま、カテゴリ合計は別途 df を再作成して辞書化。
+    g_all = df_sales_all.copy()
+    # 使う日だけに絞る
+    use_dates = set(pd.to_datetime(dates).date)
+    g_all = g_all[g_all["date"].isin(use_dates)]
 
-            # ★ 追加: 8日以上のときタイトル末尾に (1),(2)… を付与
-            page_suffix = f" ({page+1})" if num_pages > 1 else ""
+    # 全惣菜（全カテゴリ）
+    total_all_dict = g_all.groupby(["date", "store_id"])["amount"].sum().to_dict()
 
-            # 該当ページの4日分
-            page_dates = dates[page*4 : (page+1)*4]
+    # 大分類（category）合計：元CSVを読む時点で category_large を落としているため、
+    # ここでは元データ（未集約）から計算するのが理想だが、
+    # 今回は aggregate_topn に渡した df_sales（未フィルタ）を別に保持している想定がないので、
+    # df_sales_all に category_large が無いケースを考慮し、呼び出し側で
+    # 「df_sales_all は category_large を含む DataFrame」を渡す方針で運用する。
+    # もし含まない場合は、上位呼び出しで別に df_raw を渡す実装拡張が必要。
+    if "category_large" in df_sales_all.columns:
+        g_cat = df_sales_all.copy()
+        g_cat = g_cat[g_cat["date"].isin(use_dates)]
+        g_cat = g_cat[g_cat["category_large"].astype(str) == str(category)]
+        total_cat_dict = g_cat.groupby(["date", "store_id"])["amount"].sum().to_dict()
+    else:
+        # 最低限のフォールバック（TopNの金額合計を使用）
+        total_cat_dict = {}
+        for store, day_map in topn_dict.items():
+            for d, df_day in day_map.items():
+                total_cat_dict[(d, store)] = float(df_day["amount"].sum())
 
-            # ==== 各ブロックごと ====
-            for block_idx, d in enumerate(page_dates):
-                if block_idx >= 4:
-                    break
-                col_offset = block_offsets[block_idx]
-                df_day = day_map.get(pd.to_datetime(d).date())
-                if df_day is None or df_day.empty:
-                    continue
+    # === 出力先（店別）ルート
+    if split_by_store:
+        # ← ここは out_store_dir ではなく split_dir に統一
+        base_dir = Path(split_dir) if split_dir else Path(out_path).parent / "stores"
+        base_dir.mkdir(parents=True, exist_ok=True)
 
-                # === タイトル A1 ===
-                # ★ 置換: 日付は YYYY-MM-DD 表記＋ページ番号サフィックスを追加
-                title_text = f"{event_name}　{pd.to_datetime(d).strftime('%Y-%m-%d')}　{cat_name}単品データ{page_suffix}"
-                ws["A1"].value = title_text
+        # 店ごとにテンプレから新規WBを作り、該当店のシートだけ収めて保存
+        for store in sorted(topn_dict.keys(), key=lambda x: int(x)):
+            wb = load_workbook(template_path)
+            ws_tpl = wb["TEMPLATE"]
 
-                # === ブロックヘッダ ===
-                year = str(pd.to_datetime(d).year)[2:]
-                month_day = pd.to_datetime(d).strftime("%m/%d")
-                ws.cell(row=2, column=1+col_offset, value=year)
-                ws.cell(row=2, column=2+col_offset, value=month_day)
-                ws.cell(row=2, column=3+col_offset, value=short_name)
-                ws.cell(row=2, column=4+col_offset, value=f"{cat_name}単品")
+            _add_pages_for_one_store(
+                wb, ws_tpl,
+                store=store,
+                store_short_name=store_names.get(store, ""),
+                dates=dates,
+                day_map=topn_dict[store],
+                cat_name=cat_name,
+                event_name=event_name,
+                total_all_dict=total_all_dict,
+                total_cat_dict=total_cat_dict,
+                category=category,
+            )
 
-                # === 見出し ===
-                headers = ["順位", "商品名", "売上金額", "売上数量", "値引金額", "値引率"]
-                for i, h in enumerate(headers):
-                    ws.cell(row=3, column=1+col_offset+i, value=h)
+            # テンプレシートが残っていれば削除（存在チェック）
+            if "TEMPLATE" in wb.sheetnames:
+                del wb["TEMPLATE"]
 
-                # === TopNデータ (最大35行) ===
-                # 事前に金額で降順
-                df_day = df_day.sort_values("amount", ascending=False)
+            # 1番フォルダ / "1_冷総菜単品データ.xlsx"
+            subdir = base_dir / f"{int(store)}"
+            subdir.mkdir(parents=True, exist_ok=True)
+            safe_cat = f"{cat_name}".replace("/", "／").replace("\\", "／")
+            out_file = subdir / f"{int(store)}_{safe_cat}単品データ.xlsx"
+            wb.save(out_file)
 
-                for rank, row in enumerate(df_day.itertuples(index=False), start=1):
-                    if rank > 35:
-                        break
-                    r = 3 + rank
+        print(f"[ok] split saved → {base_dir}")
 
-                    # 先に数値を取り出してから値引率を計算
-                    amt  = float(getattr(row, "amount", 0) or 0.0)
-                    qty  = float(getattr(row, "qty", 0) or 0.0)
-                    disc = float(getattr(row, "discount", 0) or 0.0)
-                    rate_val = (disc / amt) if amt else 0.0
+    else:
+        # 既存：全店を1冊に
+        wb = load_workbook(template_path)
+        ws_tpl = wb["TEMPLATE"]
 
-                    ws.cell(r, 1+col_offset, rank)          # 順位
-                    ws.cell(r, 2+col_offset, getattr(row, "name", ""))  # 商品名
-                    ws.cell(r, 3+col_offset, amt)           # 売上金額
-                    ws.cell(r, 4+col_offset, qty)           # 売上数量
-                    ws.cell(r, 5+col_offset, disc)          # 値引金額
-                    cell = ws.cell(r, 6+col_offset, rate_val)  # 値引率（値を書き込む）
-                    cell.number_format = "0.00%"
+        for store in sorted(topn_dict.keys(), key=lambda x: int(x)):
+            _add_pages_for_one_store(
+                wb, ws_tpl,
+                store=store,
+                store_short_name=store_names.get(store, ""),
+                dates=dates,
+                day_map=topn_dict[store],
+                cat_name=cat_name,
+                event_name=event_name,
+                total_all_dict=total_all_dict,
+                total_cat_dict=total_cat_dict,
+                category=category,
+            )
 
+        if "TEMPLATE" in wb.sheetnames:
+            del wb["TEMPLATE"]
 
-                # === フッタ（合計行） ===
-                row_base = 39
-                ws.cell(row=row_base+1, column=1+col_offset, value="惣菜売上金額")
-                ws.cell(row=row_base+2, column=1+col_offset, value=f"{cat_name}売上金額")
-                ws.cell(row=row_base+3, column=1+col_offset, value=f"{cat_name}構成比")
-
-                # ① 惣菜売上金額＝全カテゴリ合計（全データから抽出）
-                if df_sales_all is not None:
-                    total_store_amount = (
-                        df_sales_all[
-                            (df_sales_all["store_id"] == store)
-                            & (df_sales_all["date"] == pd.to_datetime(d).date())
-                        ]["amount"]
-                        .sum()
-                    )
-                else:
-                    total_store_amount = df_day["amount"].sum()
-
-                # ② 大分類売上金額（TopN以外も含む全アイテムの合計）
-                if df_sales_all is not None:
-                    total_cat_amount = (
-                        df_sales_all[
-                            (df_sales_all["store_id"] == store)
-                            & (df_sales_all["date"] == pd.to_datetime(d).date())
-                            & (df_sales_all["category_large"].astype(str) == str(category))
-                        ]["amount"]
-                        .sum()
-                    )
-                else:
-                    total_cat_amount = df_day["amount"].sum()
-
-                # 構成比
-                ratio = total_cat_amount / total_store_amount if total_store_amount else 0
-
-                ws.cell(row=row_base+1, column=3+col_offset, value=total_store_amount)
-                ws.cell(row=row_base+2, column=3+col_offset, value=total_cat_amount)
-                ws.cell(row=row_base+3, column=3+col_offset, value=ratio)
-                ws.cell(row=row_base+3, column=3+col_offset).number_format = "0.00%"
+        wb.save(out_path)
+        print(f"[ok] saved → {out_path}")
 
 
-    del wb["TEMPLATE"]
-    wb.save(out_path)
-    print(f"[ok] saved → {out_path}")
+        # 店番スプリット（オプション）
+        if split_by_store:
+            save_per_store_files(Path(out_path), Path(split_dir), CATEGORY_MAP.get(str(category), str(category)))
 
 # === TopN 作成（store×date×大分類で金額降順TopN） ===
 def aggregate_topn(df_sales: pd.DataFrame, category: int, top_n: int = 35, dates=None):
@@ -251,11 +402,13 @@ def aggregate_topn(df_sales: pd.DataFrame, category: int, top_n: int = 35, dates
     戻り値   : dict[store_id -> dict[date -> DataFrame(TopN降順)]]
     """
     gdf = df_sales.copy()
-
-    # 型正規化
-    gdf["date"] = pd.to_datetime(gdf["date"], errors="coerce").dt.date
-    gdf["store_id"] = gdf["store_id"].astype(str)
-    gdf["category_large"] = gdf["category_large"].astype(str)
+    # 安全に型整形
+    if "date" in gdf.columns:
+        gdf["date"] = pd.to_datetime(gdf["date"], errors="coerce").dt.date
+    if "store_id" in gdf.columns:
+        gdf["store_id"] = gdf["store_id"].astype(str)
+    if "category_large" in gdf.columns:
+        gdf["category_large"] = gdf["category_large"].astype(str)
 
     # 日付フィルタ（指定時のみ）
     if dates:
@@ -294,6 +447,10 @@ if __name__ == "__main__":
     parser.add_argument("--category", type=int, required=True)
     parser.add_argument("--dates", type=str, required=True, help="YYYY-MM-DD をカンマ区切り")
     parser.add_argument("--out", type=str, required=True)
+    parser.add_argument("--split-by-store", action="store_true",
+                        help="店番ごとに別ファイルで出力する")
+    parser.add_argument("--split-dir", type=str, default="",
+                        help="店別ファイルの出力先ルート（未指定なら out と同階層に stores/）")
     args = parser.parse_args()
 
     print("[debug] 開始")
@@ -302,18 +459,23 @@ if __name__ == "__main__":
     template_path = proj_root / "data" / "template" / "配布フォーマット.xlsx"
     store_master = sales_root / "master" / "store_master.xlsx"
 
-    df_sales = load_sales(sales_root)
-    stores = load_store_master(store_master)
     dates = [pd.to_datetime(x).date() for x in args.dates.split(",")]
+    df_sales = load_sales(sales_root, dates=dates)  # ← 年月またぎで必要なCSVだけ読む
+    store_names = load_store_master(store_master)
+
     topn = aggregate_topn(df_sales, category=args.category, top_n=35, dates=dates)
 
     write_excel(
         template_path=template_path,
-        out_path=Path(args.out),          # ← ここだけを使う！
+        out_path=Path(args.out),
         topn_dict=topn,
-        store_names=stores,
+        store_names=store_names,
         category=args.category,
         dates=dates,
         event_name=args.event_name,
-        df_sales_all=df_sales,
+        df_sales_all=df_sales,         # 使っているなら
+        split_by_store=args.split_by_store,
+        split_dir=args.split_dir,      # ← これだけ渡す
     )
+
+
