@@ -1,4 +1,5 @@
 # scripts/make_topn_simple_refactor.py
+import argparse       # ← ここを追加
 import pandas as pd
 from pathlib import Path
 from openpyxl import load_workbook
@@ -11,8 +12,16 @@ CATEGORY_MAP = {
     "4": "冷総菜", "5": "軽食", "6": "魚惣菜",
 }
 
-# 先頭でimport
+# --- CLI引数 ---
+def parse_args():
+    parser = argparse.ArgumentParser(description="TopN distributor Excel generator (refactored version)")
+    parser.add_argument("--event-name", type=str, default="秋の感謝セール", help="イベント名（タイトル用）")
+    parser.add_argument("--category", type=int, default=4, help="大分類番号（1〜6）")
+    parser.add_argument("--dates", type=str, required=True, help="カンマ区切りの日付リスト 例: 2025-01-03,2025-01-10")
+    parser.add_argument("--out", type=str, required=True, help="出力先ファイルパス")
+    return parser.parse_args()
 
+# --- 条件付き書式コピー関数 ---
 def copy_conditional_formatting(ws_dst, ws_src):
     """
     copy_worksheet で失われがちな条件付き書式を、TEMPLATE から新シートへ再適用する。
@@ -57,7 +66,6 @@ def load_sales(csv_root: Path) -> pd.DataFrame:
                 return pd.read_csv(path, encoding=enc)
             except Exception:
                 continue
-            df_day = df_day.sort_values("amount", ascending=False)  # ←ここ！
         raise UnicodeDecodeError("utf-8", b"", 0, 1, f"Failed to decode {path}")
 
     df = pd.concat((read_csv_any(f) for f in files), ignore_index=True)
@@ -114,6 +122,38 @@ def build_topn(df: pd.DataFrame, top_n=30) -> dict:
         result.setdefault(store, {})[date] = g
     return result
 
+def aggregate_topn(df, category: str, top_n: int, dates):
+    """
+    入力 df: 列に date, store_id, jan, name, amount, (qty, discount 任意), category_large がある想定
+    指定の category と dates でフィルタ後、店×日ごとに amount 降順 TopN を返す。
+    戻り値: dict[str_store_id][date] = DataFrame(TopN)
+    """
+    import pandas as pd
+
+    g = df.copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce").dt.date
+    g["store_id"] = g["store_id"].astype(str).str.lstrip("0").str.strip()
+    g["jan"] = g["jan"].astype(str).str.strip()
+
+    # 対象カテゴリ & 日付
+    dates_set = set(pd.to_datetime(dates).date)
+    g = g[(g["category_large"].astype(str) == str(category)) & (g["date"].isin(dates_set))]
+
+    # 同一 (日,店,jan) を合算（安全のため）
+    agg_map = {"amount": "sum"}
+    if "qty" in g.columns: agg_map["qty"] = "sum"
+    if "discount" in g.columns: agg_map["discount"] = "sum"
+    if "name" in g.columns: agg_map["name"] = "first"
+    g = (g.groupby(["date", "store_id", "jan"], as_index=False, sort=False).agg(agg_map))
+
+    # 店×日で TopN を作る
+    topn_dict: dict[str, dict] = {}
+    for (store_id, d), df_sd in g.groupby(["store_id", "date"], sort=False):
+        df_sorted = df_sd.sort_values("amount", ascending=False).head(top_n)
+        topn_dict.setdefault(store_id, {})[d] = df_sorted.reset_index(drop=True)
+
+    return topn_dict
+
 # === Excel書き出し ===
 def write_excel(
     template_path,
@@ -123,8 +163,53 @@ def write_excel(
     category,
     dates,
     event_name="イベント名",
-    df_sales_all=None,  # ←追加
+    df_sales_all=None,
 ):
+    import pandas as pd  # 念のため
+
+    # === 合計辞書の準備（1回だけ） ===
+    total_all_dict, total_cat_dict = {}, {}
+
+    if df_sales_all is not None:
+        g = df_sales_all.copy()
+
+        # 型正規化（超重要）
+        g["date"] = pd.to_datetime(g["date"], errors="coerce").dt.date
+        g["store_id"] = (
+            g["store_id"].astype(str).str.lstrip("0").str.strip()
+        )
+
+        # 使う日だけに絞る（安全）
+        dt_set = {pd.to_datetime(x).date() for x in dates}
+        g = g[g["date"].isin(dt_set)]
+
+        # (date, store, jan) でユニーク化して4倍問題の再燃を予防
+        agg_map = {"amount": "sum"}
+        if "qty" in g.columns:
+            agg_map["qty"] = "sum"
+        if "discount" in g.columns:
+            agg_map["discount"] = "sum"
+        if "name" in g.columns:
+            agg_map["name"] = "first"
+
+        # --- 全分類の合計用 ---
+        g_norm_all = (
+            g.groupby(["date", "store_id", "jan"], as_index=False, sort=False)
+             .agg(agg_map)
+        )
+        total_all_dict = (
+            g_norm_all.groupby(["date", "store_id"])["amount"].sum().to_dict()
+        )
+
+        # --- 指定カテゴリの合計用（カテゴリ列を残したまま→ユニーク化） ---
+        g_cat = g[g["category_large"].astype(str) == str(category)]
+        g_norm_cat = (
+            g_cat.groupby(["date", "store_id", "jan"], as_index=False, sort=False)
+                 .agg(agg_map)
+        )
+        total_cat_dict = (
+            g_norm_cat.groupby(["date", "store_id"])["amount"].sum().to_dict()
+        )
 
     wb = load_workbook(template_path)
     ws_tpl = wb["TEMPLATE"]
@@ -133,6 +218,7 @@ def write_excel(
     total_days = len(dates)
     num_pages = math.ceil(total_days / 4)
     block_offsets = [0, 8, 16, 24]  # 各ブロックの列オフセット
+
 
     for store in sorted(topn_dict.keys(), key=lambda x: int(x)):
         day_map = topn_dict[store]
@@ -200,33 +286,18 @@ def write_excel(
                 ws.cell(row=row_base+2, column=1+col_offset, value=f"{cat_name}売上金額")
                 ws.cell(row=row_base+3, column=1+col_offset, value=f"{cat_name}構成比")
 
-                # ① 惣菜売上金額＝全カテゴリ合計（全データから抽出）
-                if df_sales_all is not None:
-                    total_store_amount = (
-                        df_sales_all[
-                            (df_sales_all["store_id"] == store)
-                            & (df_sales_all["date"] == pd.to_datetime(d).date())
-                        ]["amount"]
-                        .sum()
-                    )
-                else:
-                    total_store_amount = df_day["amount"].sum()
+                # ① 惣菜売上金額＝全分類合計（pre-compute辞書から取得）
+                store_key = str(store).lstrip("0").strip()
+                date_key = pd.to_datetime(d).date()
 
-                # ② 大分類売上金額（TopN以外も含む全アイテムの合計）
-                if df_sales_all is not None:
-                    total_cat_amount = (
-                        df_sales_all[
-                            (df_sales_all["store_id"] == store)
-                            & (df_sales_all["date"] == pd.to_datetime(d).date())
-                            & (df_sales_all["category_large"].astype(str) == str(category))
-                        ]["amount"]
-                        .sum()
-                    )
-                else:
-                    total_cat_amount = df_day["amount"].sum()
+                total_store_amount = int(total_all_dict.get((date_key, store_key), 0))
 
-                # 構成比
-                ratio = total_cat_amount / total_store_amount if total_store_amount else 0
+                # ② 大分類売上金額＝指定カテゴリ合計（TopNではなく “カテゴリ全体”）
+                total_cat_amount = int(total_cat_dict.get((date_key, store_key), 0))
+
+                # ③ 構成比
+                ratio = (total_cat_amount / total_store_amount) if total_store_amount else 0.0
+
 
                 ws.cell(row=row_base+1, column=3+col_offset, value=total_store_amount)
                 ws.cell(row=row_base+2, column=3+col_offset, value=total_cat_amount)
@@ -239,31 +310,62 @@ def write_excel(
     print(f"[ok] saved → {out_path}")
 
 if __name__ == "__main__":
-    print("[debug] 開始")
+    print("[debug] CLI mode start")
 
+    args = parse_args()
     root = Path("data/material")
-    df = load_sales(root)
-    print(f"[debug] sales rows={len(df)}")
+    dates = [d.strip() for d in args.dates.split(",") if d.strip()]
 
+    # カテゴリ名辞書
+    cat_map = {1:"寿司",2:"米飯",3:"温惣菜",4:"冷総菜",5:"軽食",6:"魚惣菜"}
+    cat_name = cat_map.get(args.category, f"カテゴリ{args.category}")
+
+    # 読み込み＆フィルタ
+    df_sales = load_sales(root)
     store_names = load_store_master(root / "master" / "store_master.xlsx")
-    print(f"[debug] stores={len(store_names)}")
+    df_sales = df_sales[df_sales["category_large"] == str(args.category)]
 
-    category = "4"  # 冷総菜
-    dates = ["2025-01-03", "2025-01-10", "2025-01-17", "2025-01-24"]
+    print(f"[debug] filtered rows={len(df_sales)} for category={args.category}:{cat_name}")
 
-    df_f = filter_sales(df, category, dates)
-    print(f"[debug] filtered rows={len(df_f)}")
-
-    topn = build_topn(df_f, top_n=35)
-    print(f"[debug] topn stores={len(topn)}")
-
-    write_excel(
-        template_path="data/template/配布フォーマット.xlsx",
-        out_path="data/output/topN_冷総菜_202501.xlsx",
-        topn_dict=topn,
-        store_names=store_names,
-        category=category,
+    topn_dict = aggregate_topn(
+        df=df_sales,
+        category=str(args.category),
+        top_n=35,
         dates=dates,
-        event_name="秋の感謝セール",
-        df_sales_all=df
     )
+
+    # === main/CLI 部分でルートを分離して定義 ===
+    # プロジェクトルート（この .py の1つ上の階層）
+    proj_root = Path(__file__).resolve().parents[1]
+
+    # データ(売上CSV)のルート … data/material
+    sales_root = proj_root / "data" / "material"
+
+    # テンプレートのフルパス … data/template/配布フォーマット.xlsx
+    template_path = proj_root / "data" / "template" / "配布フォーマット.xlsx"
+
+    # ストアマスタ … data/material/master/store_master.xlsx
+    store_master_path = sales_root / "master" / "store_master.xlsx"
+
+    # === 既存のロード関数呼び出しなど ===
+    df_sales = load_sales(sales_root)
+
+    # 日付配列（datetime.date に正規化）
+    dates = [pd.to_datetime(x).date() for x in args.dates.split(",")]
+
+    store_names = load_store_master(store_master_path)
+    topn_dict = aggregate_topn(df_sales, category=args.category, top_n=35, dates=dates)
+
+    # === Excel 出力 ===
+    write_excel(
+        template_path=template_path,          # ← ここを修正
+        out_path=Path(args.out),
+        topn_dict=topn_dict,
+        store_names=store_names,
+        category=args.category,
+        dates=dates,
+        event_name=args.event_name,
+        df_sales_all=df_sales,                # ← 合計辞書用に必ず渡す
+    )
+
+    print("[ok] done:", args.out)
