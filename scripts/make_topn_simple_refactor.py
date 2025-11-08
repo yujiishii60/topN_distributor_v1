@@ -6,7 +6,7 @@ from openpyxl.utils import get_column_letter
 import math
 from openpyxl.formatting.rule import Rule
 from calendar import monthrange
-# ファイル冒頭の import 群に追加
+import json
 import re
 
 CATEGORY_MAP = {
@@ -178,7 +178,7 @@ def build_topn(df: pd.DataFrame, top_n=30) -> dict:
 from openpyxl import Workbook
 
 def _add_pages_for_one_store(wb, ws_tpl, store, store_short_name, dates, day_map, cat_name, event_name,
-                             total_all_dict, total_cat_dict, category):
+                             total_all_dict, total_cat_dict, category, make_title):
     block_offsets = [0, 8, 16, 24]
     total_days = len(dates)
     num_pages = math.ceil(total_days / 4)
@@ -189,6 +189,15 @@ def _add_pages_for_one_store(wb, ws_tpl, store, store_short_name, dates, day_map
         ws.title = f"{store}({page+1})"
 
         page_dates = dates[page*4 : (page+1)*4]
+        # 代表日とページ番号（タイトル用）
+        page_no = page + 1
+        if page_dates:
+            date_str = pd.to_datetime(page_dates[0]).strftime("%Y-%m-%d")
+        else:
+            date_str = ""
+        # タイトル（A1）
+        ws["A1"].value = make_title(date_str, page_no)
+
         for block_idx, d in enumerate(page_dates):
             if block_idx >= 4: break
             col_offset = block_offsets[block_idx]
@@ -196,9 +205,6 @@ def _add_pages_for_one_store(wb, ws_tpl, store, store_short_name, dates, day_map
             df_day = day_map.get(d_date)
             if df_day is None or df_day.empty:
                 continue
-
-            # タイトル
-            ws["A1"].value = f"{event_name}　{pd.to_datetime(d).strftime('%Y-%m-%d')}　{cat_name}単品データ" + (f" ({page+1})" if num_pages>1 else "")
 
             # ブロックヘッダ
             year2 = str(pd.to_datetime(d).year)[2:]
@@ -280,18 +286,32 @@ def save_per_store_files(master_path: Path, out_root: Path, category_name: str):
         wb.close()
 
 # === Excel書き出し ===
-def write_excel(
-    template_path,
-    out_path,
-    topn_dict,
-    store_names,
-    category,
-    dates,
-    event_name="イベント名",
-    df_sales_all=None,
-    split_by_store=False,
-    split_dir="",        # ← これだけ持つ（out_store_dir は廃止）
-):
+def write_excel(template_path, out_path, topn_dict, store_names, category, dates,
+                event_name, df_sales_all=None, split_by_store=False, split_dir="",
+                title_template="{event} {date} {cat}単品データ ({page})",
+                no_date_in_title=False):
+    # --- タイトル生成のユーティリティ（外部マップ対応） ---
+    def _cat_name_from_code(code: int | str) -> str:
+        cfg = Path("config/category_map.json")
+        if cfg.exists():
+            try:
+                m = json.loads(cfg.read_text(encoding="utf-8"))
+                return m.get(str(code), str(code))
+            except Exception:
+                pass  # 壊れていても安全にフォールバック
+        # フォールバック（内蔵）
+        builtin = {"1":"寿司","2":"弁当","3":"温総菜","4":"冷総菜","5":"軽食","6":"魚惣菜"}
+        return builtin.get(str(code), str(code))
+
+    # --- タイトルテンプレ & 関数（ここだけ1回定義） ---
+    eff_tmpl = "{event} {cat}単品データ ({page})" if no_date_in_title else title_template
+    cat_name = _cat_name_from_code(category)
+    ev = (event_name or "").strip() or "（無題）"
+    def make_title(date_str: str, page_no: int) -> str:
+        return eff_tmpl.format(event=ev, date=date_str, cat=cat_name, page=page_no)
+
+    def _make_title(date_str: str, page_no: int) -> str:
+        return eff_tmpl.format(event=ev, date=date_str, cat=cat_name, page=page_no)
 
     wb0 = load_workbook(template_path)
     ws_tpl0 = wb0["TEMPLATE"]
@@ -349,6 +369,7 @@ def write_excel(
                 total_all_dict=total_all_dict,
                 total_cat_dict=total_cat_dict,
                 category=category,
+                make_title=make_title,                
             )
 
             # テンプレシートが残っていれば削除（存在チェック）
@@ -381,6 +402,7 @@ def write_excel(
                 total_all_dict=total_all_dict,
                 total_cat_dict=total_cat_dict,
                 category=category,
+                make_title=make_title,
             )
 
         if "TEMPLATE" in wb.sheetnames:
@@ -444,6 +466,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="TopN distributor Excel generator (refactored)")
     parser.add_argument("--event-name", type=str, default="秋の感謝セール")
+    parser.add_argument("--title-template",
+                        type=str,
+                        default="{event} {date} {cat}単品データ ({page})",
+                        help="A1タイトルのテンプレ。{event},{date},{cat},{page} が利用可")
+    parser.add_argument("--no-date-in-title",
+                        action="store_true",
+                        help="タイトルから日付を除外（= '{event} {cat}単品データ ({page})'）")
     parser.add_argument("--category", type=int, required=True)
     parser.add_argument("--dates", type=str, required=True, help="YYYY-MM-DD をカンマ区切り")
     parser.add_argument("--out", type=str, required=True)
@@ -476,6 +505,8 @@ if __name__ == "__main__":
         df_sales_all=df_sales,         # 使っているなら
         split_by_store=args.split_by_store,
         split_dir=args.split_dir,      # ← これだけ渡す
+        title_template=args.title_template,
+        no_date_in_title=args.no_date_in_title,
     )
 
 
