@@ -8,6 +8,8 @@ from openpyxl.formatting.rule import Rule
 from calendar import monthrange
 import json
 import re
+from datetime import datetime
+from string import Template
 
 CATEGORY_MAP = {
     "1": "寿司", "2": "米飯", "3": "温惣菜",
@@ -290,6 +292,74 @@ def write_excel(template_path, out_path, topn_dict, store_names, category, dates
                 event_name, df_sales_all=None, split_by_store=False, split_dir="",
                 title_template="{event} {date} {cat}単品データ ({page})",
                 no_date_in_title=False):
+    
+    def _dates_to_range(dates: list[str]) -> str:
+        # ['2024-12-24','2025-01-03'] → '2024-12–2025-01'（同月なら '2024-12'）
+        try:
+            ds = sorted(datetime.strptime(str(d), "%Y-%m-%d") for d in dates)
+        except Exception:
+            return ",".join(map(str, dates))
+        if not ds: 
+            return ""
+        a, b = ds[0], ds[-1]
+        return f"{a.year}-{a.month:02d}" if (a.year==b.year and a.month==b.month) else f"{a.year}-{a.month:02d}–{b.year}-{b.month:02d}"
+
+    def _build_title_from_template(event_name: str | None,
+                                  category_code: int | str,
+                                  dates_list: list[str],
+                                  page_no: int,
+                                  tmpl: str | None,
+                                  cat_name_resolver) -> str:
+        """
+        イベント名が空→テンプレ採用。テンプレ空→既定テンプレ。
+        イベント名あり→従来の「{event} {cat}単品データ（{page}）」優先。
+        """
+        cat = cat_name_resolver(category_code)
+        ev = (event_name or "").strip()
+
+        # イベント名が入っていれば従来優先
+        if ev:
+            return f"{ev} {cat}単品データ（{page_no}）"
+
+        # イベント名が空→テンプレ（未指定なら既定テンプレ）
+        default_tmpl = "{yy}年 {range} {cat}単品データ（{page}）"
+        tmpl = (tmpl or default_tmpl).strip()
+
+        # === 日付の範囲から代表日を決める ===
+        if dates_list:
+            ds_sorted = sorted(dates_list)
+            first_date_str = str(ds_sorted[0])
+            last_date_str  = str(ds_sorted[-1])  # ★追加：末尾日
+        else:
+            first_date_str = last_date_str = ""
+
+        first_date_short = first_date_str[5:].replace("-", "/") if first_date_str else ""
+        last_date_short  = last_date_str[5:].replace("-", "/") if last_date_str else ""
+
+        values = {
+            "event": ev,
+            "cat": cat,
+            "category": str(category_code),
+            "dates": ",".join(map(str, dates_list)),
+            "dates_short": ",".join(str(d)[5:].replace("-", "/") for d in dates_list),
+            "range": _dates_to_range([str(d) for d in dates_list]),
+            "year": (last_date_str[:4] if last_date_str else ""),   # ★末尾日で決定
+            "yy":   (last_date_str[2:4] if last_date_str else ""),  # ★末尾日で決定
+            "date": last_date_str,
+            "date_short": last_date_short,
+            "page": str(page_no),
+        }
+
+
+        # 1) $var 形式の置換
+        s = Template(tmpl).safe_substitute(values)
+        # 2) {var} 形式の置換（1で未展開の {} をここで仕上げ）
+        try:
+            return s.format(**values)
+        except Exception:
+            return s  # それでも失敗したら、展開できた分だけ返す
+
+
     # --- タイトル生成のユーティリティ（外部マップ対応） ---
     def _cat_name_from_code(code: int | str) -> str:
         cfg = Path("config/category_map.json")
@@ -298,8 +368,7 @@ def write_excel(template_path, out_path, topn_dict, store_names, category, dates
                 m = json.loads(cfg.read_text(encoding="utf-8"))
                 return m.get(str(code), str(code))
             except Exception:
-                pass  # 壊れていても安全にフォールバック
-        # フォールバック（内蔵）
+                pass
         builtin = {"1":"寿司","2":"弁当","3":"温総菜","4":"冷総菜","5":"軽食","6":"魚惣菜"}
         return builtin.get(str(code), str(code))
 
@@ -307,11 +376,20 @@ def write_excel(template_path, out_path, topn_dict, store_names, category, dates
     eff_tmpl = "{event} {cat}単品データ ({page})" if no_date_in_title else title_template
     cat_name = _cat_name_from_code(category)
     ev = (event_name or "").strip() or "（無題）"
+    
+    # --- タイトル関数（イベント名が空ならテンプレ発動） ---
     def make_title(date_str: str, page_no: int) -> str:
-        return eff_tmpl.format(event=ev, date=date_str, cat=cat_name, page=page_no)
+        # no_date_in_title=True の時はテンプレに日付情報を渡さない
+        dlist = [] if no_date_in_title else [str(d) for d in dates]
+        return _build_title_from_template(
+            event_name=event_name,
+            category_code=category,
+            dates_list=dlist,
+            page_no=page_no,
+            tmpl=title_template,
+            cat_name_resolver=_cat_name_from_code,
+        )
 
-    def _make_title(date_str: str, page_no: int) -> str:
-        return eff_tmpl.format(event=ev, date=date_str, cat=cat_name, page=page_no)
 
     wb0 = load_workbook(template_path)
     ws_tpl0 = wb0["TEMPLATE"]
@@ -467,9 +545,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TopN distributor Excel generator (refactored)")
     parser.add_argument("--event-name", type=str, default="秋の感謝セール")
     parser.add_argument("--title-template",
-                        type=str,
-                        default="{event} {date} {cat}単品データ ({page})",
-                        help="A1タイトルのテンプレ。{event},{date},{cat},{page} が利用可")
+                    type=str,
+                    default="{yy}年 {range} {cat}単品データ（{page}）",
+                    help=("A1タイトルのテンプレ。{event},{cat},{page} に加えて "
+                          "{range},{dates},{dates_short},{category},{year},{yy},{date},{date_short} が利用可。"
+                          "イベント名が空欄のとき自動で本テンプレが使用されます"))
     parser.add_argument("--no-date-in-title",
                         action="store_true",
                         help="タイトルから日付を除外（= '{event} {cat}単品データ ({page})'）")
