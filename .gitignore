@@ -2,3 +2,7 @@ data/output/
 data/cache/
 scripts/__pycache__/
 *.xlsx
+data/output/
+data/cache/
+scripts/__pycache__/
+*.xlsx
