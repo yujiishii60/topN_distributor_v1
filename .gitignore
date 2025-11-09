@@ -2,3 +2,15 @@ data/output/
 data/cache/
 scripts/__pycache__/
 *.xlsxscripts/make_topn_excel.py
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# App outputs
+data/output/
+data/cache/
+*.xlsx
+
+# VSCode
+.vscode/

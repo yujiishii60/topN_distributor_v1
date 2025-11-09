@@ -24,9 +24,19 @@ from string import Template
 import json
 from datetime import datetime
 try:
-    from tkcalendar import Calendar            # 追加（カレンダーUI）
+    from tkcalendar import Calendar
 except Exception:
     Calendar = None
+
+# ← ここまではOK（インポートだけ）
+# --- add once at the very top ---
+import sys, pathlib
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
+# ---------------------------------
+
+from styles import theme_cyber, theme_pastel
+from styles.apply_ttk_min import apply_theme
+from styles.widgets import make_calendar, style_toplevel
 
 APP_PATH = Path(__file__).resolve()
 REPO_ROOT = APP_PATH.parent.parent
@@ -262,16 +272,30 @@ class TopNGuiApp:
             self.var_event.set(s)
 
     def _open_date_picker(self):
+        # tkcalendar 無い時のフォールバックはそのまま
         if Calendar is None:
-            messagebox.showinfo("カレンダー未導入",
+            messagebox.showinfo(
+                "カレンダー未導入",
                 "tkcalendar が見つかりませんでした。\n\npip install tkcalendar\n\n"
-                "当面はテキスト入力（YYYY-MM-DD をカンマ区切り）で指定してください。")
+                "当面はテキスト入力（YYYY-MM-DD をカンマ区切り）で指定してください。"
+            )
             return
 
+        theme = self.theme         # ← いまのテーマを使う
+
+        # ダイアログ
         top = tk.Toplevel(self.root)
         top.title("対象日を追加")
         top.grab_set()
-        pad = {'padx': 8, 'pady': 6}
+        style_toplevel(top, theme)  # ← 地の色をテーマに合わせる
+
+        # ダイアログ内は“カード面”で統一するためコンテナFrameを1枚かます
+        container = ttk.Frame(top, padding=8)
+        container.grid(row=0, column=0, sticky="nsew")
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)
+
+        pad = {"padx": 8, "pady": 6}
 
         # 既存値を正規化して読み込み
         def _parse_dates(s: str) -> list[str]:
@@ -289,13 +313,22 @@ class TopNGuiApp:
 
         current = _parse_dates(self.var_dates.get())
 
-        # 左: カレンダー
-        cal = Calendar(top, selectmode="day", date_pattern="yyyy-mm-dd")
+        # 左: カレンダー（テーマ連動）
+        cal = make_calendar(container, theme)
+        if cal is None:
+            messagebox.showinfo("カレンダー未導入", "tkcalendar が見つかりませんでした。")
+            return
+        cal.configure(date_pattern="yyyy-mm-dd")  # 表示/取得フォーマット
         cal.grid(row=0, column=0, rowspan=4, sticky="nsew", **pad)
 
-        # 右: 選択済みリスト
-        ttk.Label(top, text="選択済み").grid(row=0, column=1, sticky="w", **pad)
-        lb = tk.Listbox(top, height=10, exportselection=False)
+        # 右: 選択済みリスト（tk.Listbox をテーマ色で）
+        ttk.Label(container, text="選択済み").grid(row=0, column=1, sticky="w", **pad)
+        lb = tk.Listbox(
+            container, height=10, exportselection=False,
+            bg=theme.surface, fg=theme.text,
+            selectbackground=theme.primary, selectforeground=theme.bg,
+            highlightthickness=0, bd=0, relief="flat"
+        )
         lb.grid(row=1, column=1, sticky="nsew", **pad)
         for d in current:
             lb.insert(tk.END, d)
@@ -310,17 +343,20 @@ class TopNGuiApp:
 
         def remove_selected():
             sel = list(lb.curselection())
-            if not sel: return
+            if not sel:
+                return
             for idx in reversed(sel):
                 val = lb.get(idx)
                 if val in current:
                     current.remove(val)
                 lb.delete(idx)
 
-        btns = ttk.Frame(top); btns.grid(row=2, column=1, sticky="w", **pad)
+        # 右: 追加/削除ボタン（ttk → 自動でテーマ適用）
+        btns = ttk.Frame(container); btns.grid(row=2, column=1, sticky="w", **pad)
         ttk.Button(btns, text="追加", command=add_date).pack(side=tk.LEFT)
         ttk.Button(btns, text="削除", command=remove_selected).pack(side=tk.LEFT, padx=6)
 
+        # OK/キャンセル
         def on_ok():
             self.var_dates.set(",".join(current))
             top.destroy()
@@ -328,14 +364,14 @@ class TopNGuiApp:
         def on_cancel():
             top.destroy()
 
-        cmd = ttk.Frame(top); cmd.grid(row=3, column=1, sticky="e", **pad)
+        cmd = ttk.Frame(container); cmd.grid(row=3, column=1, sticky="e", **pad)
         ttk.Button(cmd, text="OK", command=on_ok).pack(side=tk.LEFT, padx=6)
         ttk.Button(cmd, text="キャンセル", command=on_cancel).pack(side=tk.LEFT)
 
-        # レイアウト伸縮
-        top.columnconfigure(0, weight=1)
-        top.columnconfigure(1, weight=1)
-        top.rowconfigure(1, weight=1)
+        # 伸縮レイアウト
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(1, weight=1)
 
     # ===== ファイル選択（Browse系） =====
     def _browse_save_xlsx(self, var):
@@ -479,16 +515,41 @@ class TopNGuiApp:
 
 def main():
     root = tk.Tk()
+    root.title("GUI Launcher")
+
+    # 高DPIスケーリング（先にやる）
     try:
         root.call('tk', 'scaling', 1.2)
-        style = ttk.Style(root)
-        if 'vista' in style.theme_names():
-            style.theme_use('vista')
-        elif 'xpnative' in style.theme_names():
-            style.theme_use('xpnative')
     except Exception:
         pass
+
+    # 現在テーマの単一ソース
+    current = {"t": theme_cyber.theme}           # ← デフォルトはサイバー
+    apply_theme(root, current["t"])              # ← 一括適用
+
+    # アプリ本体を生成し、テーマを共有（self.theme を参照できるように）
     app = TopNGuiApp(root)
+    app.theme = current["t"]                     # ← 重要：ダイアログ等から参照
+
+    # Ctrl+T で パステル ↔ サイバー
+    def _toggle(_=None):
+        current["t"] = (theme_pastel.theme
+                        if current["t"].name == "cyber"
+                        else theme_cyber.theme)
+        app.theme = current["t"]                 # ← アプリ側の現在テーマも更新
+        apply_theme(root, current["t"])          # ← 再適用（即時着せ替え）
+    root.bind("<Control-t>", _toggle)
+
+    # ※ 旧来の 'vista' / 'xpnative' 切替は撤去（apply_theme を上書きするため）
+    # try:
+    #     style = ttk.Style(root)
+    #     if 'vista' in style.theme_names():
+    #         style.theme_use('vista')
+    #     elif 'xpnative' in style.theme_names():
+    #         style.theme_use('xpnative')
+    # except Exception:
+    #     pass
+
     root.mainloop()
 
 if __name__ == '__main__':
