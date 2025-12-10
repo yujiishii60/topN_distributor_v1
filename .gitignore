@@ -8,9 +8,9 @@ __pycache__/
 .venv/
 
 # App outputs
-data/output/
-data/cache/
 *.xlsx
 
 # VSCode
 .vscode/
+dist/
+build/
