@@ -1,2 +1,2 @@
-tkcalendar
-tkcalendar>=1.6.1
+﻿tkcalendar>=1.6.1
+babel>=2.17.0

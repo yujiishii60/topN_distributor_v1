@@ -105,3 +105,11 @@ data/output/split/<店番>/<店番>_寿司単品データ.xlsx
 ファイル: data/output/split/1/1_寿司単品データ.xlsx
 
 依存パッケージ: tkcalendar (pip install tkcalendar)
+
+
+
+# 初回セットアップ（GUI）
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+
+# 起動
+powershell -ExecutionPolicy Bypass -File .\run_gui.ps1
