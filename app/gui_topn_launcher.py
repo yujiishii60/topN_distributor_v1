@@ -480,7 +480,7 @@ class TopNGuiApp:
             exists_main = out_file.exists()
             split_count = 0
             if self.var_split.get() and split_dir.exists():
-                split_count = len(list(split_dir.glob('*.xlsx')))
+                split_count = len(list(split_dir.rglob('*.xlsx')))
             self._append_log(f"[postcheck] main_exists={exists_main} split_count={split_count}\n")
             if code == 0:
                 msg = f"処理完了\n本体: {'あり' if exists_main else 'なし'}\nsplit: {split_count} 件"

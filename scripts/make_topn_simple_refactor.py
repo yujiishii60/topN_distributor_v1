@@ -16,6 +16,15 @@ CATEGORY_MAP = {
     "4": "冷総菜", "5": "軽食", "6": "魚惣菜",
 }
 
+def store_folder_name(store_id) -> str:
+    """店番フォルダ名（2桁ゼロ埋め）"""
+    s = str(store_id).strip()
+    try:
+        return f"{int(s):02d}"
+    except Exception:
+        # 数字以外はそのまま（必要ならここでsanitize）
+        return s
+
 def _month_keys_from_dates(dates):
     """dates(list[str or date]) → {'2024-12', '2025-01'} のような集合"""
     dt = pd.to_datetime(dates).date
@@ -281,9 +290,10 @@ def save_per_store_files(master_path: Path, out_root: Path, category_name: str):
                 wb.remove(ws)
 
         # 保存先: split/<店番>/<店番>_<大分類名>単品データ.xlsx
-        out_dir = out_root / sid
+        sid2 = store_folder_name(sid)
+        out_dir = out_root / sid2
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{sid}_{category_name}単品データ.xlsx"
+        out_path = out_dir / f"{sid2}_{category_name}単品データ.xlsx"
         wb.save(out_path)
         wb.close()
 
@@ -455,10 +465,11 @@ def write_excel(template_path, out_path, topn_dict, store_names, category, dates
                 del wb["TEMPLATE"]
 
             # 1番フォルダ / "1_冷総菜単品データ.xlsx"
-            subdir = base_dir / f"{int(store)}"
+            sid2 = store_folder_name(store)
+            subdir = base_dir / sid2
             subdir.mkdir(parents=True, exist_ok=True)
             safe_cat = f"{cat_name}".replace("/", "／").replace("\\", "／")
-            out_file = subdir / f"{int(store)}_{safe_cat}単品データ.xlsx"
+            out_file = subdir / f"{sid2}_{safe_cat}単品データ.xlsx"
             wb.save(out_file)
 
         print(f"[ok] split saved → {base_dir}")
